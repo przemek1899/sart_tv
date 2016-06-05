@@ -1,6 +1,7 @@
 ﻿#include "mex.h"
 #include "gpu/mxGPUArray.h"
 #include "matrix.h"
+#include <cuda_runtime.h>
 #include "cublas_v2.h"
 #include "cusparse_v2.h"
 #include "helper_cuda.h"
@@ -10,11 +11,8 @@
 #include "sart_constants.h"
 
 // cublas indexing macro
-#define IDX2C(i,j,ld) (((j)*(ld))+(i))
-#define IN_ARGS_NUM 6
-
-const int ONES_SIZE = 5400;
-__constant__ double ONES_DEV[ONES_SIZE];
+//#define IDX2C(i,j,ld) (((j)*(ld))+(i))
+//#define IN_ARGS_NUM 8
 
 const cusparseDirection_t dirA_col = CUSPARSE_DIRECTION_COLUMN;
 const cusparseDirection_t dirA_row = CUSPARSE_DIRECTION_ROW;
@@ -22,6 +20,41 @@ const cusparseOperation_t NON_TRANS = CUSPARSE_OPERATION_NON_TRANSPOSE;
 const cusparseOperation_t TRANS = CUSPARSE_OPERATION_TRANSPOSE;
 
 // JAKAŚ METODA CLEANUP BY SIĘ PRZYDAŁA DO PONIŻSZYCH METOD
+static const char *_cusparseGetErrorEnum(cusparseStatus_t status)
+{
+    switch (status)
+    {
+        case CUSPARSE_STATUS_SUCCESS:
+            return "cusparse_success";
+
+        case CUSPARSE_STATUS_NOT_INITIALIZED:
+            return "cusparseNotInitialized";
+
+		case CUSPARSE_STATUS_ALLOC_FAILED:
+			return "cusparseAllocFailed";
+
+		case CUSPARSE_STATUS_INVALID_VALUE:
+			return "cusparseInvalidValue";
+
+		case CUSPARSE_STATUS_ARCH_MISMATCH:
+			return "cusparseArchMismatch";
+
+		case CUSPARSE_STATUS_MAPPING_ERROR:
+			return "cusparseMappingError";
+		
+		case CUSPARSE_STATUS_EXECUTION_FAILED:
+			return "cusparseExecutionFailed";
+
+		case CUSPARSE_STATUS_INTERNAL_ERROR:
+			return "cusparseInternalError";
+
+		case CUSPARSE_STATUS_MATRIX_TYPE_NOT_SUPPORTED:
+			return "cusparseMatrixTypeNotSupported";
+	}
+
+    return "<unknown>";
+}
+
 template< typename T >
 void checkCusparse2(T result, char const *const func, const char *const file, int const line)
 {
@@ -38,12 +71,11 @@ void checkCusparse2(T result, char const *const func, const char *const file, in
 #define checkCusparseErrors(val)           checkCusparse2 ( (val), #val, __FILE__, __LINE__ )
 
 void checkCuda();
-void checkCusparse(cusparseStatus_t status);
 void checkCublas(cublasStatus_t status);
 void checkCufft(cufftResult_t status);
 
 void verifyArguments(int nlhs, mxArray *plhs[], int nrhs, mxArray const *prhs[]);
-void verifyRetrievedPointers(mxGPUArray const *A, mxGPUArray const *b);
+void verifyRetrievedPointers(mxGPUArray const *Aval, mxGPUArray const *rowInd, mxGPUArray const *colInd, mxGPUArray const *b);
 void exitProgramWithErrorMessage(char *);
 void initOnes(double *p, int n);
 
@@ -51,11 +83,17 @@ int stopping_rule(char * stoprule, int k, int kmax);
 
 __global__ void normalizeVectorSum(double * v, int n);
 __global__ void saxdotpy(double a, double * x, double *y, double n, double *z);
+__global__ void elemByElem(int n, double *x, double *y, double *z);
+__global__ void absComplex(cufftDoubleComplex * idata, double *odata, int n);
+
+//thrust::plus<double> binary_op; 
+double init = 0.0;  //słabo czytelna zmienna
 
 void mexFunction(int nlhs, mxArray *plhs[], int nrhs, mxArray const *prhs[]){
 
 	// [X,info,restart] = sart(A,m,n,b,K)
 	// [X,info,restart] = sart(A,m,n,b,K,x0)
+	// mexFunction(Aval, rowInd, colInd, nnzPerRow, nnz, rows, cols, b, K)
 
 	char * stoprule = "NO";
     bool nonneg = false;
@@ -79,10 +117,16 @@ void mexFunction(int nlhs, mxArray *plhs[], int nrhs, mxArray const *prhs[]){
 	optionally:
 	X0 - X vector with initial values
 
+	matrix A of size m x n (m = rows, n = cols)
+	vector b of length m (rows)
+	vector x of length n (cols)
+	rxk - size of vector b
+	
 	*/
 
-	mxGPUArray const *Aval, const *rowInd, const *colInd, const *b, const *X0;
-	double const *d_Aval, const *d_rowInd, const *d_colInd, const *d_b;
+	mxGPUArray const *Aval, *rowInd, *colInd, *b, *X0;
+	double const *d_Aval, *d_b;
+	int const* d_rowInd, *d_colInd;
 
 	mxGPUArray *X;
 	double *d_X, *d_x0;
@@ -91,21 +135,26 @@ void mexFunction(int nlhs, mxArray *plhs[], int nrhs, mxArray const *prhs[]){
 	mxInitGPU();
 	verifyArguments(nlhs, plhs, nrhs, prhs);
 
-	/* Retrieve input arguments */
-	Aval = mxGPUCreateFromMxArray(prhs[0]);
-	rowInd = mxGPUCreateFromMxArray(prhs[1]);
-	colInd = mxGPUCreateFromMxArray(prhs[2]);
-	int nnz = mxGetScalar(prhs[3]);
-	int rows = mxGetScalar(prhs[4]); 
-	int cols = mxGetScalar(prhs[5]);
-	b = mxGPUCreateFromMxArray(prhs[6]); 
-	int K = mxGetScalar(prhs[7]);
+	int args_count = -1;
 
-	int n_sqrt = (int) sqrt(n);
-	if (n_sqrt*n_sqrt != n)
+	/* Retrieve input arguments */
+	Aval = mxGPUCreateFromMxArray(prhs[++args_count]); // 0
+	rowInd = mxGPUCreateFromMxArray(prhs[++args_count]); // 1
+	colInd = mxGPUCreateFromMxArray(prhs[++args_count]); // 2
+	int nnz = mxGetScalar(prhs[++args_count]); // 3
+	int rows = mxGetScalar(prhs[++args_count]); // 4
+	int cols = mxGetScalar(prhs[++args_count]); // 5
+	b = mxGPUCreateFromMxArray(prhs[++args_count]); // 6
+	int K = mxGetScalar(prhs[++args_count]); // 7
+	
+	const int ONES_SIZE = cols*(cols>rows) + rows*(rows>cols);
+	int required_args = ++args_count; // 8
+
+	int n_sqrt = (int) sqrt(cols);
+	if (n_sqrt*n_sqrt != cols)
 		exitProgramWithErrorMessage("Rozmiar n (liczba kolumn) macierzy A, nie jest kwadratem liczby całkowitej");
 
-	verifyRetrievedPointers(A, b);
+	verifyRetrievedPointers(Aval, rowInd, colInd, b); // x0 ??
 	// TODO Matlab checking error - check that the sizes of A and b match
 
 	d_Aval = (double const *)(mxGPUGetDataReadOnly(Aval));
@@ -116,7 +165,7 @@ void mexFunction(int nlhs, mxArray *plhs[], int nrhs, mxArray const *prhs[]){
 	/* Create a GPUArray to hold the result and get its underlying pointer. */
 	mwSize X_num_dim = 1;
 	mwSize X_dims[1]; // X_dmis[1] = {m};
-	X_dims[0] = rows;
+	X_dims[0] = cols;
     X = mxGPUCreateGPUArray(X_num_dim, X_dims, mxGPUGetClassID(Aval), mxGPUGetComplexity(Aval), MX_GPU_DO_NOT_INITIALIZE);
     d_X = (double *)(mxGPUGetData(X));
 
@@ -127,57 +176,58 @@ void mexFunction(int nlhs, mxArray *plhs[], int nrhs, mxArray const *prhs[]){
 	// ---------------------------------- CUSPARSE initialization -------------------------------------
 	cusparseHandle_t cusparse_handle = 0;  // po co przypisywać te zero ??
 	cusparseMatDescr_t descrA=0;
-	int *nnzPerRow, *csrRowPtrA, *csrColIndA;
-	double* csrValA;
+	//int *nnzPerRow, *csrRowPtrA, *csrColIndA;
+	//double* csrValA;
+	int *csrRowPtrA;
 	int lda = rows;
-	checkCusparse(cusparseCreate(&cusparse_handle));
+	checkCusparseErrors(cusparseCreate(&cusparse_handle));
 
 	// ---------------------------------- CUFFT initialization ----------------------------------------
 	cufftHandle cufft_plan;
 	checkCufft(cufftPlan2d(&cufft_plan, n_sqrt, n_sqrt, CUFFT_R2C));
 
-	
-
 
 	// ---------------------------------- rxk and x0 initialization -----------------------------------
 	checkCudaErrors(cudaMalloc((void**)&d_rxk, rows*sizeof(double)));
 	checkCudaErrors(cudaMemcpy(d_rxk, d_b, rows*sizeof(double), cudaMemcpyDeviceToDevice)); // rxk = b
-	if (nrhs < 6){
-		checkCudaErrors(cudaMalloc((void**)&d_x0, rows*sizeof(double)));
-		checkCudaErrors(cudaMemset(d_x0, 0, rows*sizeof(double)));
+	if (nrhs < (required_args + 1)){
+		checkCudaErrors(cudaMalloc((void**)&d_x0, cols*sizeof(double)));
+		checkCudaErrors(cudaMemset(d_x0, 0, cols*sizeof(double)));
 	}
 	else{
-		X0 = mxGPUCreateFromMxArray(prhs[5]);
+		X0 = mxGPUCreateFromMxArray(prhs[required_args]);
 		d_x0 = (double *)(mxGPUGetDataReadOnly(X0)); // czy na pewno read only??
 	}
 
 	// alokacja pamieci dla procedur cusparse
-	checkCudaErrors(cudaMalloc((void**)&nnzPerRow, rows*sizeof(int)));
+	//checkCudaErrors(cudaMalloc((void**)&nnzPerRow, rows*sizeof(int)));
 
 	// --------------------------------------- CUSPARSE CONVERSE DENSE TO CSR -------------------------------------------
-	checkCusparse(cusparseCreateMatDescr(&descrA));
+	checkCusparseErrors(cusparseCreateMatDescr(&descrA));
 	cusparseSetMatType(descrA, CUSPARSE_MATRIX_TYPE_GENERAL);
 	cusparseSetMatIndexBase(descrA, CUSPARSE_INDEX_BASE_ZERO);
 	
-	//checkCusparse(cusparseDnnz(cusparse_handle, dirA_row, m, n, descrA, d_A, lda, nnzPerRow, nnzTotal));
-
+	// as we get saprse coo format from matlab we no longer need compute nnzTotal, and nnzPerRow
+	//checkCusparseErrors(cusparseDnnz(cusparse_handle, dirA_row, rows, cols, descrA, d_A, lda, nnzPerRow, nnzTotal));
+	
+	checkCudaErrors(cudaMalloc((void**)&csrRowPtrA, (rows+1)*sizeof(int)));
 	//checkCudaErrors(cudaMalloc((void**)&csrValA, (*nnzTotal)*sizeof(double)));
-	checkCudaErrors(cudaMalloc((void**)&csrRowPtrA, (m+1)*sizeof(int)));
 	//checkCudaErrors(cudaMalloc((void**)&csrColIndA, (*nnzTotal)*sizeof(int)));
 	
 	// dalej w programie, dla obliczeń A*x0 będziemy potrzebować macierzy A w formacie CSR (compressed sparse row)
-	//checkCusparse(cusparseDdense2csr(cusparse_handle, m, n, descrA, d_A, lda, nnzPerRow, csrValA, csrRowPtrA, csrColIndA));
+	//checkCusparseErrors(cusparseDdense2csr(cusparse_handle, m, n, descrA, d_A, lda, nnzPerRow, csrValA, csrRowPtrA, csrColIndA));
 
-	// uwaga nowe
-	checkCusparse(cusparseXcoo2csr(cusparse_handle, d_rowInd, nnz, rows, csrRowPtrA, CUSPARSE_INDEX_BASE_ZERO));
+	// --------- convert from coo sparse format (given already from matlab) to csr -------------------
+	// a może skoro cols jest znacznie wieksze (262144) to może przechowywać w csc ??
+	checkCusparseErrors(cusparseXcoo2csr(cusparse_handle, d_rowInd, nnz, rows, csrRowPtrA, CUSPARSE_INDEX_BASE_ZERO));
 
 
 	// --------------------------------------- rxk CALCULATIONS --------------------------------------------------
-	if (nrhs > 5){ // jesli x0 jest podane jako argument, czyli A*x0 nie jest równe 0
+	if (nrhs > required_args){ // jesli x0 jest podane jako argument, czyli A*x0 nie jest równe 0
 		// rxk = b - A*x0, przy czym rxk juz jest rowne b, wiec robimy tylko, rxk - A*x0
 		// Mnożenie A*x0, y = α ∗ op ( A ) ∗ x + β ∗ y
-		// stare - checkCusparse(cusparseDcsrmv(cusparse_handle, NON_TRANS, m, n, *nnzTotal, &negative, descrA, csrValA, csrRowPtrA, csrColIndA, d_x0, &positive, d_rxk));
-		checkCusparse(cusparseDcsrmv(cusparse_handle, NON_TRANS, rows, cols, nnz, &negative, descrA, csrValA, csrRowPtrA, csrColIndA, d_x0, &positive, d_rxk));
+		// stare - checkCusparseErrors(cusparseDcsrmv(cusparse_handle, NON_TRANS, m, n, *nnzTotal, &negative, descrA, csrValA, csrRowPtrA, csrColIndA, d_x0, &positive, d_rxk));
+		checkCusparseErrors(cusparseDcsrmv(cusparse_handle, NON_TRANS, rows, cols, nnz, &negative, descrA, d_Aval, csrRowPtrA, d_colInd, d_x0, &positive, d_rxk));
 	}
 
 	// -------------------------------------- V, W VECTORS CALCULATIONS ------------------------------------------
@@ -191,34 +241,42 @@ void mexFunction(int nlhs, mxArray *plhs[], int nrhs, mxArray const *prhs[]){
 	// ----------------- SPOSÓB NR 2 - MNOŻENIE MACIERZY PRZEZ WEKTOR JEDYNEK -------------------------------------
 	// ----------------- SPOSÓB NR 2 - MNOŻENIE MACIERZY PRZEZ WEKTOR JEDYNEK -------------------------------------
 
-	checkCudaErrors(cudaMalloc((void**)&d_W, m*sizeof(double)));
-	checkCudaErrors(cudaMalloc((void**)&d_V, n*sizeof(double)));
+	checkCudaErrors(cudaMalloc((void**)&d_W, rows*sizeof(double)));
+	checkCudaErrors(cudaMalloc((void**)&d_V, cols*sizeof(double)));
 
 	HOST_ONES = (double*) malloc(ONES_SIZE*sizeof(double));
 	initOnes(HOST_ONES, ONES_SIZE);
-	checkCudaErrors(cudaMemcpyToSymbol(ONES_DEV, HOST_ONES, ONES_SIZE*sizeof(double)));
+	// checkCudaErrors(cudaMemcpyToSymbol(ONES_DEV, HOST_ONES, ONES_SIZE*sizeof(double))); -- constant device memory is not suitable for cusparse operations
 
 	// d_A - macierz zwykla - cublas itp.
 	// csrValA - macierz w formacie rzadkim - cusparse
 	//checkCublas(cublasDgemv(cublas_handle, cublasOperation_t trans, m, n, const double * alpha, d_A, lda, ONES_DEV, 1, const double * beta, double * y, 1));
+	
+	double *d_ones;
+	checkCudaErrors(cudaMalloc((void**)&d_ones, ONES_SIZE*sizeof(double)));
+	checkCudaErrors(cudaMemcpy(d_ones, HOST_ONES, ONES_SIZE*sizeof(double), cudaMemcpyHostToDevice));
 
 	// y = α ∗ op ( A ) ∗ x + β ∗ y - csrmv
-	checkCusparse(cusparseDcsrmv(cusparse_handle, NON_TRANS, m, n, *nnzTotal, &positive, descrA, csrValA, csrRowPtrA, csrColIndA, ONES_DEV, &zero, d_W));
-	checkCusparse(cusparseDcsrmv(cusparse_handle, TRANS, m, n, *nnzTotal, &positive, descrA, csrValA, csrRowPtrA, csrColIndA, ONES_DEV, &zero, d_V));
+	// stare - checkCusparseErrors(cusparseDcsrmv(cusparse_handle, NON_TRANS, m, n, *nnzTotal, &positive, descrA, csrValA, csrRowPtrA, csrColIndA, ONES_DEV, &zero, d_W));
+	// stare - checkCusparseErrors(cusparseDcsrmv(cusparse_handle, TRANS, m, n, *nnzTotal, &positive, descrA, csrValA, csrRowPtrA, csrColIndA, ONES_DEV, &zero, d_V));
+	checkCusparseErrors(cusparseDcsrmv(cusparse_handle, NON_TRANS, rows, cols, nnz, &positive, descrA, d_Aval, csrRowPtrA, d_colInd, d_ones, &zero, d_W));
+	checkCusparseErrors(cusparseDcsrmv(cusparse_handle, TRANS, rows, cols, nnz, &positive, descrA, d_Aval, csrRowPtrA, d_colInd, d_ones, &zero, d_V));
 
 	cudaDeviceSynchronize();
 	checkCudaErrors(cudaGetLastError());
+	mexPrintf("Po mnozeniu macierzy A przez wektor jedynek\n");
 	// a może strumieniowo ?
 	int threads = 256;
 	int blocks1D = 32;
-	normalizeVectorSum<<<blocks1D, threads>>>(d_W, m);
+	normalizeVectorSum<<<blocks1D, threads>>>(d_W, rows);
 	cudaDeviceSynchronize();
 	checkCudaErrors(cudaGetLastError());
 	
-	normalizeVectorSum<<<blocks1D, threads>>>(d_V, n);
+	// TODO konfiguracja kernela 
+	normalizeVectorSum<<<cols/threads, threads>>>(d_V, cols);
 	cudaDeviceSynchronize();
 	checkCudaErrors(cudaGetLastError());
-
+	mexPrintf("po normalizacji normalizeVectorSum\n");
 	// SPRAWDZIĆ JAK ZACHOWUJE SIĘ GPU PRZY DZIELENIU PRZEZ ZERO
 
 	// tutaj możemy sprawdzić, czy wynik jest poprawny
@@ -239,12 +297,13 @@ void mexFunction(int nlhs, mxArray *plhs[], int nrhs, mxArray const *prhs[]){
 
 	// W i V NIE SĄ wektorami rzadkimi, zdecydowana większość to elementy niezerowe
 	// zakładamy, że m > n
-	checkCudaErrors(cudaMalloc((void**)&d_Wrxk, m*sizeof(double)));
-	checkCudaErrors(cudaMalloc((void**)&d_AW, n*sizeof(double)));
+	checkCudaErrors(cudaMalloc((void**)&d_Wrxk, rows*sizeof(double)));
+	checkCudaErrors(cudaMalloc((void**)&d_AW, cols*sizeof(double)));
 	
 	cufftDoubleComplex *fft2_data;
-	checkCudaErrors(cudaMalloc((void**)&fft2_data, (2*n+1)*sizeof(cufftDoubleComplex))); // 2*sizeof(double)
+	checkCudaErrors(cudaMalloc((void**)&fft2_data, (cols/2+1)*sizeof(cufftDoubleComplex))); // 2*sizeof(double)
 
+	mexPrintf("przed petla while\n");
 	int stop = 0;
 	int iteration = 1;
 	while(!stop){
@@ -261,13 +320,22 @@ void mexFunction(int nlhs, mxArray *plhs[], int nrhs, mxArray const *prhs[]){
 				3. xk + lambda*(V.*z)
 				xk siedzi chyba w d_x0
 			*/
-			// d_AW =  W.*rxk, dlugosc m
-			checkCublas(cublasDdot(cublas_handle, m, d_W, 1, d_rxk, 1, d_Wrxk));
-			checkCusparse(cusparseDcsrmv(cusparse_handle, TRANS, m, n, *nnzTotal, &positive, descrA, csrValA, csrRowPtrA, csrColIndA, d_Wrxk, &zero, d_AW));
-			
+			// d_AW =  W.*rxk, dlugosc m - chyba nie
 			threads = 256;
 			blocks1D = 32;
-			saxdotpy<<<blocks1D, threads>>>(lambda, d_V, d_AW, n, d_x0);
+			elemByElem<<<blocks1D, threads>>>(rows, d_W, d_rxk, d_Wrxk);
+			cudaDeviceSynchronize();
+			checkCudaErrors(cudaGetLastError());
+			//mexPrintf("po elemByElem\n");
+
+		
+			checkCusparseErrors(cusparseDcsrmv(cusparse_handle, TRANS, rows, cols, nnz, &positive, descrA, d_Aval, csrRowPtrA, d_colInd, d_Wrxk, &zero, d_AW));
+			checkCudaErrors(cudaGetLastError());
+			//mexPrintf("po cusparse csrmv dot\n");			
+
+			threads = 256;
+			blocks1D = 32;
+			saxdotpy<<<cols/threads, threads>>>(lambda, d_V, d_AW, cols, d_x0);
 
 			cudaDeviceSynchronize();
 			checkCudaErrors(cudaGetLastError());
@@ -289,7 +357,11 @@ void mexFunction(int nlhs, mxArray *plhs[], int nrhs, mxArray const *prhs[]){
 	    // założenie jest takie, że nn jest liczbą całkowitą (n jest kwadratem liczby całkowitej)
 
 		// fft2 jest obliczane dla liczb rzeczywistych
+
+		//mexPrintf("przed fft2\n");
 		cufftExecD2Z(cufft_plan, d_x0, fft2_data);
+		mexPrintf("po fft2\n");
+
 		// FB - tu siedzi FFT2
 		// fb = FB(:);
 		// thresh = var(abs(fb))*median(abs(fb(2:end)))*max(10+k,10+K);%(K-k+1);
@@ -306,8 +378,8 @@ void mexFunction(int nlhs, mxArray *plhs[], int nrhs, mxArray const *prhs[]){
 		// może trzeba zrobić, że wcześniej w rxk siedzi już b
 
 		// TODO poniższa linika kopiowania pamięci do optymalizacji !!!
-		checkCudaErrors(cudaMemcpy(d_rxk, d_b, m*sizeof(double), cudaMemcpyDeviceToDevice));
-		checkCusparse(cusparseDcsrmv(cusparse_handle, NON_TRANS, m, n, *nnzTotal, &negative, descrA, csrValA, csrRowPtrA, csrColIndA, d_x0, &positive, d_rxk));
+		checkCudaErrors(cudaMemcpy(d_rxk, d_b, rows*sizeof(double), cudaMemcpyDeviceToDevice));
+		checkCusparseErrors(cusparseDcsrmv(cusparse_handle, NON_TRANS, rows, cols, nnz, &negative, descrA, d_Aval, csrRowPtrA, d_colInd, d_x0, &positive, d_rxk));
 
 		// stopping rule - OPAKOWAĆ TO W FUNKCJĘ
 		//stop = stopping_rule();
@@ -318,13 +390,13 @@ void mexFunction(int nlhs, mxArray *plhs[], int nrhs, mxArray const *prhs[]){
 
 
 	// ----------------------------------------- WRAP RESULTS FOR MATLAB --------------------------------------
-	checkCudaErrors(cudaMemcpy(d_X, d_rxk, m*sizeof(double), cudaMemcpyDeviceToDevice));
+	checkCudaErrors(cudaMemcpy(d_X, d_x0, cols*sizeof(double), cudaMemcpyDeviceToDevice));
 	/* Wrap the result up as a MATLAB gpuArray for return. */
     plhs[0] = mxGPUCreateMxArrayOnGPU(X);	
 
    /* The mxGPUArray pointers are host-side structures that refer to device
     * data. These must be destroyed before leaving the MEX function.  */
-    mxGPUDestroyGPUArray(A);
+    //mxGPUDestroyGPUArray(A);
 	mxGPUDestroyGPUArray(b);
     mxGPUDestroyGPUArray(X);
 
@@ -335,22 +407,23 @@ void mexFunction(int nlhs, mxArray *plhs[], int nrhs, mxArray const *prhs[]){
 	// ------------------------------ CLEANUP -----------------------------
 	cufftDestroy(cufft_plan);
 	checkCublas(cublasDestroy(cublas_handle));
-	checkCusparse(cusparseDestroyMatDescr(descrA));
-	checkCusparse(cusparseDestroy(cusparse_handle));
+	checkCusparseErrors(cusparseDestroyMatDescr(descrA));
+	checkCusparseErrors(cusparseDestroy(cusparse_handle));
 	free(HOST_ONES);
 	//free(nnzTotal);
+	checkCudaErrors(cudaFree(d_ones));
 	checkCudaErrors(cudaFree(fft2_data));
 	checkCudaErrors(cudaFree(d_rxk));
-	checkCudaErrors(cudaFree(nnzPerRow));
+	//checkCudaErrors(cudaFree(nnzPerRow));
 	checkCudaErrors(cudaFree(d_Wrxk));
 	checkCudaErrors(cudaFree(d_AW));
 	checkCudaErrors(cudaFree(d_W));
 	checkCudaErrors(cudaFree(d_V));
-	checkCudaErrors(cudaFree(csrValA));
+	//checkCudaErrors(cudaFree(csrValA));
 	checkCudaErrors(cudaFree(csrRowPtrA));
-	checkCudaErrors(cudaFree(csrColIndA));
+	//checkCudaErrors(cudaFree(csrColIndA));
 
-	if (nrhs < 6){
+	if (nrhs < (required_args+1)){
 		cudaFree(d_x0);
 	}
 	else{
@@ -360,12 +433,21 @@ void mexFunction(int nlhs, mxArray *plhs[], int nrhs, mxArray const *prhs[]){
 	// THE END
 }
 
-void verifyRetrievedPointers(mxGPUArray const *A, mxGPUArray const *b){
-	// Verify that A and b really are a double array before extracting the pointer.
-    if (mxGPUGetClassID(A) != mxDOUBLE_CLASS) {
+void verifyRetrievedPointers(mxGPUArray const *Aval, mxGPUArray const *rowInd, mxGPUArray const *colInd, mxGPUArray const *b){
+	// Verify that Aval, rowInd, colInd and b really are double array before extracting the pointer.
+    if (mxGPUGetClassID(Aval) != mxDOUBLE_CLASS) {
 		cudaDeviceReset();
-		const char * errMsg = "Invalid Input argument: A is not a double array";
+		const char * errMsg = "Invalid Input argument: Aval is not a double array";
         mexErrMsgIdAndTxt(errId, errMsg); // errMsg
+    }
+	if (mxGPUGetClassID(rowInd) != mxINT32_CLASS) {
+		cudaDeviceReset();
+        mexErrMsgIdAndTxt(errId, "Invalid Input argument: rowInd is not a mxINT32_CLASS array, it is %d\n", mxGPUGetClassID(rowInd)); // errMsg
+    }
+	if (mxGPUGetClassID(colInd) != mxINT32_CLASS) {
+		cudaDeviceReset();
+		const char * errMsg = "Invalid Input argument: colInd is not a mxINT32_CLASS array";
+        mexErrMsgIdAndTxt(errId, errMsg);
     }
 	if (mxGPUGetClassID(b) != mxDOUBLE_CLASS) {
 		cudaDeviceReset();
@@ -384,39 +466,28 @@ void checkCublas(cublasStatus_t status){
 
 void verifyArguments(int nlhs, mxArray *plhs[], int nrhs, mxArray const *prhs[]){
 	/* Throw an error if the input is not a GPU array. */
-	if (nrhs < 5){
-		const char * errMsg = "Invalid Input argument: nrhs < 5";
+	// mexFunction arguments (Aval, rowInd, colInd, nnz, rows, cols, b, K)
+	if (nrhs < 8){
 		cudaDeviceReset();
-		mexErrMsgIdAndTxt(errId, errMsg);
+		mexErrMsgIdAndTxt(errId, "Invalid Input argument: nrhs < 8");
 	}
 	else if(!(mxIsGPUArray(prhs[0]))){
-		const char * errMsg = "Invalid Input argument: prhs[0] is not a GPU array";
 		cudaDeviceReset();
-        mexErrMsgIdAndTxt(errId, errMsg);
+        mexErrMsgIdAndTxt(errId, "Invalid Input argument: prhs[0] is not a GPU array");
 	}
-	else if(!(mxIsGPUArray(prhs[3]))){
-		const char * errMsg = "Invalid Input argument: prhs[3] is not a GPU array";
+	else if(!(mxIsGPUArray(prhs[1]))){
 		cudaDeviceReset();
-        mexErrMsgIdAndTxt(errId, errMsg);
+        mexErrMsgIdAndTxt(errId, "Invalid Input argument: prhs[1] is not a GPU array");
 	}
-
-	/*
-    if ((nrhs < 5) || !(mxIsGPUArray(prhs[0])) || !(mxIsGPUArray(prhs[3]))) {
+	else if(!(mxIsGPUArray(prhs[2]))){
 		cudaDeviceReset();
-		const char * errMsg = "Invalid Input argument: nrhs < 5 or (prhs[0] or prhs[3] is not a GPU array";
-        mexErrMsgIdAndTxt(errId, errMsg);
-    }
-	*/
-}
-
-void checkCusparse(cusparseStatus_t status){
-	//mexPrintf("cusparse status %d\n", status);
-	if (status != CUSPARSE_STATUS_SUCCESS) {
+        mexErrMsgIdAndTxt(errId, "Invalid Input argument: prhs[2] is not a GPU array");
+	}
+	else if(!(mxIsGPUArray(prhs[6]))){
 		cudaDeviceReset();
-		mexErrMsgIdAndTxt("Cusparse error ", "code error %d\n", status);
+        mexErrMsgIdAndTxt(errId, "Invalid Input argument: prhs[6] is not a GPU array");
 	}
 }
-
 
 void checkCufft(cufftResult_t status){
 	if (status != CUFFT_SUCCESS) {
@@ -481,42 +552,68 @@ __global__ void saxdotpy(double a, double * x, double *y, double n, double *z){
 
 	if (index < n){
 		z[index] += a*x[index]*y[index]; 
+		//x[index] = a*y[index];
 	}
 }
 
-static const char *_cusparseGetErrorEnum(cusparseStatus_t status)
-{
-    switch (status)
-    {
-        case CUSPARSE_STATUS_SUCCESS:
-            return "cusparse_success";
+__global__ void elemByElem(int n, double *x, double *y, double *z){
 
-        case CUSPARSE_STATUS_NOT_INITIALIZED:
-            return "cusparseNotInitialized";
+	int index = threadIdx.x + blockDim.x*blockIdx.x;
 
-		case CUSPARSE_STATUS_ALLOC_FAILED:
-			return "cusparseAllocFailed";
-
-		case CUSPARSE_STATUS_INVALID_VALUE:
-			return "cusparseInvalidValue";
-
-		case CUSPARSE_STATUS_ARCH_MISMATCH:
-			return "cusparseArchMismatch";
-
-		case CUSPARSE_STATUS_MAPPING_ERROR:
-			return "cusparseMappingError";
-		
-		case CUSPARSE_STATUS_EXECUTION_FAILED:
-			return "cusparseExecutionFailed";
-
-		case CUSPARSE_STATUS_INTERNAL_ERROR:
-			return "cusparseInternalError";
-
-		case CUSPARSE_STATUS_MATRIX_TYPE_NOT_SUPPORTED:
-			return "cusparseMatrixTypeNotSupported";
+	if (index < n){
+		z[index] = x[index]*y[index]; 
 	}
+}
 
-    return "<unknown>";
+/*compute sqrt root of complex c
+	Newtow's method for computing sqrt
+*/
+__device__ __inline__ cuDoubleComplex sqrtComplex(cuDoubleComplex c){
+
+	//Csub - subtract two double complex number: x - y
+	//Cmul - multiplicate two double complex number: x*y
+
+	cuDoubleComplex x = c;
+	cuDoubleComplex real2 = make_cuDoubleComplex (2.0, 0.0);
+	/*
+	for(unsigned iter=0; iter<10; iter++){
+		x = cuCsub(x,cuCdivf(cuCsub(cuCmul(x,x), c), cuCmul(real2,x))); //
+	}*/
+
+	//we can unroll the loop - czy na pewno??
+	/*1*/ x = cuCsub(x,cuCdiv(cuCsub(cuCmul(x,x), c), cuCmul(real2,x)));
+	/*2*/ x = cuCsub(x,cuCdiv(cuCsub(cuCmul(x,x), c), cuCmul(real2,x)));
+	/*3*/ x = cuCsub(x,cuCdiv(cuCsub(cuCmul(x,x), c), cuCmul(real2,x)));
+	/*4*/ x = cuCsub(x,cuCdiv(cuCsub(cuCmul(x,x), c), cuCmul(real2,x)));
+	/*5*/ x = cuCsub(x,cuCdiv(cuCsub(cuCmul(x,x), c), cuCmul(real2,x)));
+	/*6*/ x = cuCsub(x,cuCdiv(cuCsub(cuCmul(x,x), c), cuCmul(real2,x)));
+	/*7*/ x = cuCsub(x,cuCdiv(cuCsub(cuCmul(x,x), c), cuCmul(real2,x)));
+	/*8*/ x = cuCsub(x,cuCdiv(cuCsub(cuCmul(x,x), c), cuCmul(real2,x)));
+	/*9*/ x = cuCsub(x,cuCdiv(cuCsub(cuCmul(x,x), c), cuCmul(real2,x)));
+	/*10*/ x = cuCsub(x,cuCdiv(cuCsub(cuCmul(x,x), c), cuCmul(real2,x)));
+
+/*
+	int iter;
+	for(iter=0; iter<10; iter++){
+		x = cuCsubf(x,cuCdivf(cuCsubf(cuCmulf(x,x), c), cuCmulf(real2,x))); //
+	}
+*/
+
+	return x;
+}
+
+__global__ void absComplex(cufftDoubleComplex * idata, double *odata, int n){
+	/*
+		Instead of completely eliminating the loop when parallelizing the computation, 
+		a grid-stride loop approach is used here
+	*/
+
+    for (int i = blockIdx.x * blockDim.x + threadIdx.x; i < n; i += blockDim.x * gridDim.x){
+		cufftDoubleComplex c = idata[i];
+		double x2 = c.x*c.x; // pow2
+		double y2 = c.y*c.y; // pow2
+		odata[i] = sqrt(x2+y2);
+	}
 }
 
 static const char *_cublasGetErrorEnum(cublasStatus_t status)

@@ -14,6 +14,8 @@
 #define IDX2C(i,j,ld) (((j)*(ld))+(i))
 #define IN_ARGS_NUM 6
 
+const int ONES_SIZE = 5400;
+
 const cusparseDirection_t dirA_col = CUSPARSE_DIRECTION_COLUMN;
 const cusparseDirection_t dirA_row = CUSPARSE_DIRECTION_ROW;
 const cusparseOperation_t NON_TRANS = CUSPARSE_OPERATION_NON_TRANSPOSE;
@@ -54,6 +56,7 @@ static const char *_cusparseGetErrorEnum(cusparseStatus_t status)
 
     return "<unknown>";
 }
+template< typename T >
 void checkCusparse2(cusparseStatus_t result, char const *const func, const char *const file, int const line)
 {
     if (result)
@@ -69,37 +72,23 @@ void checkCusparse2(cusparseStatus_t result, char const *const func, const char 
 #define checkCusparseErrors(val)           checkCusparse2 ( (val), #val, __FILE__, __LINE__ )
 
 void checkCuda();
-void checkCusparse(cusparseStatus_t status);
 //void checkCublas(cublasStatus_t status);
 void checkCufft(cufftResult_t status);
 
 void verifyArguments(int nlhs, mxArray *plhs[], int nrhs, mxArray const *prhs[]);
-void verifyRetrievedPointers(mxGPUArray const *A, mxGPUArray const *b);
+void verifyRetrievedPointers(mxGPUArray const *Aval, mxGPUArray const *rowInd, mxGPUArray const *colInd, mxGPUArray const *b);
 void exitProgramWithErrorMessage(char *);
 void initOnes(double *p, int n);
 
 int stopping_rule(char * stoprule, int k, int kmax);
 
-
-thrust::plus<double> binary_op; 
-double init = 0; 
-const int ONES_SIZE = 5400;
 __global__ void normalizeVectorSum(double * v, int n);
 __global__ void saxdotpy(double a, double * x, double *y, double n, double *z);
 __global__ void elemByElem(int n, double *x, double *y, double *z);
 __global__ void absComplex(cufftDoubleComplex * idata, double *odata, int n);
 
-template <typename T>
-struct var_functor{
-
-	const T mean;
-
-	var_functor(T _mean) : mean(_mean) {}
-
-	__host__ __device__ T operator() (const T&x) const{
-		return pow(x - mean, 2.0);
-	}
-}
+thrust::plus<double> binary_op; 
+double init = 0.0;  //słabo czytelna zmienna
 
 void mexFunction(int nlhs, mxArray *plhs[], int nrhs, mxArray const *prhs[]){
 
@@ -435,12 +424,22 @@ void mexFunction(int nlhs, mxArray *plhs[], int nrhs, mxArray const *prhs[]){
 	// THE END
 }
 
-void verifyRetrievedPointers(mxGPUArray const *A, mxGPUArray const *b){
-	// Verify that A and b really are a double array before extracting the pointer.
-    if (mxGPUGetClassID(A) != mxDOUBLE_CLASS) {
+void verifyRetrievedPointers(mxGPUArray const *Aval, mxGPUArray const *rowInd, mxGPUArray const *colInd, mxGPUArray const *b){
+	// Verify that Aval, rowInd, colInd and b really are double array before extracting the pointer.
+    if (mxGPUGetClassID(Aval) != mxDOUBLE_CLASS) {
 		cudaDeviceReset();
-		const char * errMsg = "Invalid Input argument: A is not a double array";
+		const char * errMsg = "Invalid Input argument: Aval is not a double array";
         mexErrMsgIdAndTxt(errId, errMsg); // errMsg
+    }
+	if (mxGPUGetClassID(rowInd) != mxDOUBLE_CLASS) {
+		cudaDeviceReset();
+		const char * errMsg = "Invalid Input argument: rowInd is not a double array";
+        mexErrMsgIdAndTxt(errId, errMsg); // errMsg
+    }
+	if (mxGPUGetClassID(colInd) != mxDOUBLE_CLASS) {
+		cudaDeviceReset();
+		const char * errMsg = "Invalid Input argument: colInd is not a double array";
+        mexErrMsgIdAndTxt(errId, errMsg);
     }
 	if (mxGPUGetClassID(b) != mxDOUBLE_CLASS) {
 		cudaDeviceReset();
@@ -460,39 +459,28 @@ void checkCublas(cublasStatus_t status){
 
 void verifyArguments(int nlhs, mxArray *plhs[], int nrhs, mxArray const *prhs[]){
 	/* Throw an error if the input is not a GPU array. */
-	if (nrhs < 5){
-		const char * errMsg = "Invalid Input argument: nrhs < 5";
+	// mexFunction arguments (Aval, rowInd, colInd, nnz, rows, cols, b, K)
+	if (nrhs < 8){
 		cudaDeviceReset();
-		mexErrMsgIdAndTxt(errId, errMsg);
+		mexErrMsgIdAndTxt(errId, "Invalid Input argument: nrhs < 8";);
 	}
 	else if(!(mxIsGPUArray(prhs[0]))){
-		const char * errMsg = "Invalid Input argument: prhs[0] is not a GPU array";
 		cudaDeviceReset();
-        mexErrMsgIdAndTxt(errId, errMsg);
+        mexErrMsgIdAndTxt(errId, "Invalid Input argument: prhs[0] is not a GPU array";);
 	}
-	else if(!(mxIsGPUArray(prhs[3]))){
-		const char * errMsg = "Invalid Input argument: prhs[3] is not a GPU array";
+	else if(!(mxIsGPUArray(prhs[1]))){
 		cudaDeviceReset();
-        mexErrMsgIdAndTxt(errId, errMsg);
+        mexErrMsgIdAndTxt(errId, "Invalid Input argument: prhs[1] is not a GPU array";);
 	}
-
-	/*
-    if ((nrhs < 5) || !(mxIsGPUArray(prhs[0])) || !(mxIsGPUArray(prhs[3]))) {
+	else if(!(mxIsGPUArray(prhs[2]))){
 		cudaDeviceReset();
-		const char * errMsg = "Invalid Input argument: nrhs < 5 or (prhs[0] or prhs[3] is not a GPU array";
-        mexErrMsgIdAndTxt(errId, errMsg);
-    }
-	*/
-}
-
-void checkCusparse(cusparseStatus_t status){
-	//mexPrintf("cusparse status %d\n", status);
-	if (status != CUSPARSE_STATUS_SUCCESS) {
+        mexErrMsgIdAndTxt(errId, "Invalid Input argument: prhs[2] is not a GPU array";);
+	}
+	else if(!(mxIsGPUArray(prhs[6]))){
 		cudaDeviceReset();
-		mexErrMsgIdAndTxt("Cusparse error ", "code error %d\n", status);
+        mexErrMsgIdAndTxt(errId, "Invalid Input argument: prhs[6] is not a GPU array";);
 	}
 }
-
 
 void checkCufft(cufftResult_t status){
 	if (status != CUFFT_SUCCESS) {
@@ -650,5 +638,22 @@ static const char *_cublasGetErrorEnum(cublasStatus_t status)
 	}
 	   
 	return "<unknown>";
+}
+
+
+int getRound(int m, int n){
+
+	if (m % n == 0)
+		return m;
+	else
+		return (m/n) * n + n;
+}
+
+int getBlocks(int len, int threads){
+
+	if (len % threads == 0)
+		return len / threads;
+	else
+		return (len/threads * threads + threads)/threads;
 }
 */

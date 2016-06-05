@@ -24,6 +24,19 @@ char const * const errCusparseId = "parallel:gpu:mexGPU:CUSPARSE_ERROR";
 char const * const errCublasId = "parallel:gpu:mexGPU:CUBLAS_ERROR";
 //char const * const errMsg = "Invalid input to MEX file.";
 
+/*
+template <typename T>
+struct var_functor{
+
+	const T mean;
+
+	var_functor(T _mean) : mean(_mean) {}
+
+	__host__ __device__ T operator() (const T&x) const{
+		return pow(x - mean, 2.0);
+	}
+}*/
+
 #endif
 
 /*
