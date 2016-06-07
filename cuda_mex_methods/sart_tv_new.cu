@@ -85,6 +85,13 @@ __global__ void normalizeVectorSum(double * v, int n);
 __global__ void saxdotpy(double a, double * x, double *y, double n, double *z);
 __global__ void elemByElem(int n, double *x, double *y, double *z);
 __global__ void absComplex(cufftDoubleComplex * idata, double *odata, int n);
+template <typename T> __global__ void divide_and_abs_fft2(cufftDoubleComplex * idata, T *odata, int odata_len, int fft2_m, int fft2_n, T divider);
+template <typename T> __global__ void order_fft2_data(cufftDoubleComplex * idata, T *odata, int fft2_rows, int fft2_cols);
+template <unsigned int blockSize> __global__ void variance6(double *g_idata, double* g_odata, unsigned int n, double* reduce_sum, double sum_divider);
+template <unsigned int blockSize> __global__ void reduce6(double *g_idata, double* g_odata, unsigned int n);
+__global__ void reduce2(double *g_idata, double *g_odata);
+__global__ void reduce3(double *g_idata, double *g_odata);
+__global__ void variance2(double *g_idata, double *g_odata, double* reduce_sum, double sum_divider);
 
 //thrust::plus<double> binary_op; 
 double init = 0.0;  //słabo czytelna zmienna
@@ -169,6 +176,20 @@ void mexFunction(int nlhs, mxArray *plhs[], int nrhs, mxArray const *prhs[]){
     X = mxGPUCreateGPUArray(X_num_dim, X_dims, mxGPUGetClassID(Aval), mxGPUGetComplexity(Aval), MX_GPU_DO_NOT_INITIALIZE);
     d_X = (double *)(mxGPUGetData(X));
 
+	mxGPUArray *U_matlab; double * d_U_matlab;
+	U_matlab = mxGPUCreateGPUArray(X_num_dim, X_dims, mxGPUGetClassID(Aval), mxGPUGetComplexity(Aval), MX_GPU_INITIALIZE_VALUES);
+	d_U_matlab = (double *)	(mxGPUGetData(U_matlab));
+
+
+	mwSize R_dims[1];
+	R_dims[0] = 512;
+	mxGPUArray *reduction_matlab; double * d_reduction_matlab;
+	reduction_matlab = mxGPUCreateGPUArray(X_num_dim, R_dims, mxGPUGetClassID(Aval), mxGPUGetComplexity(Aval), MX_GPU_INITIALIZE_VALUES);
+	d_reduction_matlab = (double *)	(mxGPUGetData(reduction_matlab));
+
+	double mean_check;
+	double var_check;
+
 	// ---------------------------------- CUBLAS initialization ---------------------------------------
 	cublasHandle_t cublas_handle;
 	checkCublas(cublasCreate(&cublas_handle));
@@ -183,8 +204,8 @@ void mexFunction(int nlhs, mxArray *plhs[], int nrhs, mxArray const *prhs[]){
 	checkCusparseErrors(cusparseCreate(&cusparse_handle));
 
 	// ---------------------------------- CUFFT initialization ----------------------------------------
-	cufftHandle cufft_plan;
-	checkCufft(cufftPlan2d(&cufft_plan, n_sqrt, n_sqrt, CUFFT_R2C));
+	cufftHandle plan2d_U;
+	checkCufft(cufftPlan2d(&plan2d_U, n_sqrt, n_sqrt, CUFFT_D2Z));
 
 
 	// ---------------------------------- rxk and x0 initialization -----------------------------------
@@ -256,6 +277,13 @@ void mexFunction(int nlhs, mxArray *plhs[], int nrhs, mxArray const *prhs[]){
 	checkCudaErrors(cudaMalloc((void**)&d_ones, ONES_SIZE*sizeof(double)));
 	checkCudaErrors(cudaMemcpy(d_ones, HOST_ONES, ONES_SIZE*sizeof(double), cudaMemcpyHostToDevice));
 
+	double *d_reduction; int reduction_len = n_sqrt; // must be <= 1024 (max number of threads per block)
+	checkCudaErrors(cudaMalloc((void**)&d_reduction, reduction_len*sizeof(double)));
+
+	double *d_reduction_result, *d_variance_result;
+	checkCudaErrors(cudaMalloc((void**)&d_reduction_result, sizeof(double)));
+	checkCudaErrors(cudaMalloc((void**)&d_variance_result, sizeof(double)));
+
 	// y = α ∗ op ( A ) ∗ x + β ∗ y - csrmv
 	// stare - checkCusparseErrors(cusparseDcsrmv(cusparse_handle, NON_TRANS, m, n, *nnzTotal, &positive, descrA, csrValA, csrRowPtrA, csrColIndA, ONES_DEV, &zero, d_W));
 	// stare - checkCusparseErrors(cusparseDcsrmv(cusparse_handle, TRANS, m, n, *nnzTotal, &positive, descrA, csrValA, csrRowPtrA, csrColIndA, ONES_DEV, &zero, d_V));
@@ -268,11 +296,15 @@ void mexFunction(int nlhs, mxArray *plhs[], int nrhs, mxArray const *prhs[]){
 	// a może strumieniowo ?
 	int threads = 256;
 	int blocks1D = 32;
+	int smemSize;	
+
 	normalizeVectorSum<<<blocks1D, threads>>>(d_W, rows);
 	cudaDeviceSynchronize();
 	checkCudaErrors(cudaGetLastError());
 	
 	// TODO konfiguracja kernela 
+	if (cols < threads)
+		threads = cols;
 	normalizeVectorSum<<<cols/threads, threads>>>(d_V, cols);
 	cudaDeviceSynchronize();
 	checkCudaErrors(cudaGetLastError());
@@ -300,8 +332,12 @@ void mexFunction(int nlhs, mxArray *plhs[], int nrhs, mxArray const *prhs[]){
 	checkCudaErrors(cudaMalloc((void**)&d_Wrxk, rows*sizeof(double)));
 	checkCudaErrors(cudaMalloc((void**)&d_AW, cols*sizeof(double)));
 	
-	cufftDoubleComplex *fft2_data;
-	checkCudaErrors(cudaMalloc((void**)&fft2_data, (cols/2+1)*sizeof(cufftDoubleComplex))); // 2*sizeof(double)
+	cufftDoubleComplex *U_fft2;
+	int U_fft2_size = n_sqrt*(n_sqrt/2+1);
+	checkCudaErrors(cudaMalloc((void**)&U_fft2, U_fft2_size*sizeof(cufftDoubleComplex))); // 2*sizeof(double)
+
+	double * abs_fft2;
+	checkCudaErrors(cudaMalloc((void**)&abs_fft2, cols*sizeof(double))); // tutaj do zastanowenia sie
 
 	mexPrintf("przed petla while\n");
 	int stop = 0;
@@ -335,6 +371,10 @@ void mexFunction(int nlhs, mxArray *plhs[], int nrhs, mxArray const *prhs[]){
 
 			threads = 256;
 			blocks1D = 32;
+			
+			// TODO kernel configuration
+			if (cols < threads)
+				threads = cols;
 			saxdotpy<<<cols/threads, threads>>>(lambda, d_V, d_AW, cols, d_x0);
 
 			cudaDeviceSynchronize();
@@ -359,12 +399,52 @@ void mexFunction(int nlhs, mxArray *plhs[], int nrhs, mxArray const *prhs[]){
 		// fft2 jest obliczane dla liczb rzeczywistych
 
 		//mexPrintf("przed fft2\n");
-		cufftExecD2Z(cufft_plan, d_x0, fft2_data);
-		mexPrintf("po fft2\n");
+		cufftExecD2Z(plan2d_U, d_x0, U_fft2); // U_fft2 - n_sqrt * (nsqrt/2 + 1)
+
+		// var(abs(fb))*median(abs(fb(2:end)))
+		threads = 256;
+		blocks1D = 32;
+		//absComplex<<<cols/threads, threads>>>(U_fft2, abs_fft2, n/2+1);
+		divide_and_abs_fft2<<<n_sqrt, n_sqrt>>>(U_fft2, abs_fft2, U_fft2_size, n_sqrt, n_sqrt, (double) n_sqrt);
+		//order_fft2_data<<<n_sqrt/2+1, n_sqrt>>>(U_fft2, abs_fft2, n_sqrt, n_sqrt/2+1);
+		cudaDeviceSynchronize();
+		checkCudaErrors(cudaGetLastError());
 
 		// FB - tu siedzi FFT2
 		// fb = FB(:);
 		// thresh = var(abs(fb))*median(abs(fb(2:end)))*max(10+k,10+K);%(K-k+1);
+
+		// liczymy średnią - mean, metodą redukcji
+	
+		// d_reduction is of length reduction_len
+		smemSize = reduction_len*sizeof(double);
+		//reduce6<512> <<<reduction_len/2, reduction_len, smemSize>>>(abs_fft2, d_reduction, cols);
+		//reduce2<<<reduction_len, reduction_len, smemSize>>>(abs_fft2, d_reduction);
+		reduce3<<<reduction_len/2, reduction_len, smemSize>>>(abs_fft2, d_reduction);
+		cudaDeviceSynchronize();
+		checkCudaErrors(cudaGetLastError());
+
+		//reduce6<512> <<<1, reduction_len, smemSize>>>(d_reduction, d_reduction_result, reduction_len);
+		//reduce2<<<1, reduction_len, smemSize>>>(d_reduction, d_reduction_result);
+		reduce2<<<1, reduction_len, smemSize>>>(d_reduction, d_reduction_result);
+		cudaDeviceSynchronize();
+		checkCudaErrors(cudaGetLastError());
+			
+		// obliczamy wariancję - najpierw trzeba policzyć średnią mean
+		// TODO variance
+
+		
+		//variance6<512> <<<reduction_len, reduction_len, smemSize>>>(abs_fft2, d_reduction, cols, d_reduction_result, (double)cols);
+		variance2<<<reduction_len, reduction_len, smemSize>>>(abs_fft2, d_reduction, d_reduction_result, (double)cols);
+		cudaDeviceSynchronize();
+		checkCudaErrors(cudaGetLastError());
+
+		reduce2<<<1, reduction_len, smemSize>>>(d_reduction, d_variance_result);
+		cudaDeviceSynchronize();
+		checkCudaErrors(cudaGetLastError());
+		
+		
+
 		// picks = find(abs(FB)>thresh);
 		// B = FB(picks);
 		// [UU,Out_RecPF] = RecPF(nn,nn,aTV,aL1,picks,B,2,opts,PsiT,Psi,range(U(:)),U);
@@ -391,8 +471,18 @@ void mexFunction(int nlhs, mxArray *plhs[], int nrhs, mxArray const *prhs[]){
 
 	// ----------------------------------------- WRAP RESULTS FOR MATLAB --------------------------------------
 	checkCudaErrors(cudaMemcpy(d_X, d_x0, cols*sizeof(double), cudaMemcpyDeviceToDevice));
+	checkCudaErrors(cudaMemcpy(d_U_matlab, abs_fft2, cols*sizeof(double), cudaMemcpyDeviceToDevice));
+	checkCudaErrors(cudaMemcpy(d_reduction_matlab, d_reduction, reduction_len*sizeof(double), cudaMemcpyDeviceToDevice));
+	//checkCudaErrors(cudaMemcpy(&mean_check, d_reduction_result, sizeof(double), cudaMemcpyDeviceToHost));
+	checkCudaErrors(cudaMemcpy(&var_check, d_variance_result, sizeof(double), cudaMemcpyDeviceToHost));
+	
 	/* Wrap the result up as a MATLAB gpuArray for return. */
-    plhs[0] = mxGPUCreateMxArrayOnGPU(X);	
+    plhs[0] = mxGPUCreateMxArrayOnGPU(X);
+	plhs[1] = mxGPUCreateMxArrayOnGPU(U_matlab);
+
+	plhs[2] = mxGPUCreateMxArrayOnGPU(reduction_matlab);
+	//plhs[2] = mxCreateDoubleScalar(mean_check); // mean
+	plhs[3] = mxCreateDoubleScalar(var_check); // variance
 
    /* The mxGPUArray pointers are host-side structures that refer to device
     * data. These must be destroyed before leaving the MEX function.  */
@@ -403,16 +493,21 @@ void mexFunction(int nlhs, mxArray *plhs[], int nrhs, mxArray const *prhs[]){
 	mxGPUDestroyGPUArray(Aval);
 	mxGPUDestroyGPUArray(rowInd);
 	mxGPUDestroyGPUArray(colInd);
+	mxGPUDestroyGPUArray(U_matlab);
 
 	// ------------------------------ CLEANUP -----------------------------
-	cufftDestroy(cufft_plan);
+	cufftDestroy(plan2d_U);
 	checkCublas(cublasDestroy(cublas_handle));
 	checkCusparseErrors(cusparseDestroyMatDescr(descrA));
 	checkCusparseErrors(cusparseDestroy(cusparse_handle));
 	free(HOST_ONES);
 	//free(nnzTotal);
+	checkCudaErrors(cudaFree(d_reduction));
+	checkCudaErrors(cudaFree(d_reduction_result));
+	checkCudaErrors(cudaFree(d_variance_result));
+	checkCudaErrors(cudaFree(abs_fft2));
 	checkCudaErrors(cudaFree(d_ones));
-	checkCudaErrors(cudaFree(fft2_data));
+	checkCudaErrors(cudaFree(U_fft2));
 	checkCudaErrors(cudaFree(d_rxk));
 	//checkCudaErrors(cudaFree(nnzPerRow));
 	checkCudaErrors(cudaFree(d_Wrxk));
@@ -616,6 +711,49 @@ __global__ void absComplex(cufftDoubleComplex * idata, double *odata, int n){
 	}
 }
 
+template <typename T>
+__global__ void order_fft2_data(cufftDoubleComplex * idata, T *odata, int fft2_rows, int fft2_cols){
+
+	int difference = fft2_rows - fft2_cols;
+	int index = threadIdx.x + blockIdx.x*fft2_rows;
+	int index2 = index + index/fft2_cols*difference;//difference*blockIdx.x + difference*(threadIdx.x >= fft2_cols);
+	
+	odata[index2] = idata[index].x;
+}
+
+template <typename T>
+__global__ void fill_remaining_fft2_data(cufftDoubleComplex * idata, T *odata, int fft2_rows, int fft2_cols){
+
+}
+
+template <typename T> __global__ void divide_and_abs_fft2(cufftDoubleComplex * idata, T *odata, int odata_len, int fft2_m, int fft2_n, T divider){
+	/*
+	this kernel should be run in 
+	*/
+
+	int x = threadIdx.x;
+	int y = blockIdx.x;
+
+	int x2 = (fft2_m - x) % fft2_m;
+	int y2 = (fft2_n - y) % fft2_n;
+
+	int cut_cols = fft2_n/2+1;
+
+	int out_index = x + y*fft2_m;
+	int in_index = (x + y*cut_cols)*(x < cut_cols) + (x2 + y2*cut_cols)*(x >= cut_cols);
+
+	if(in_index < odata_len){
+		cufftDoubleComplex c = idata[in_index];
+		c.x /= divider;
+		c.y /= divider;
+		T x_pow = c.x*c.x;
+		T y_pow = c.y*c.y;
+		//odata[index] = sqrt(x_pow+y_pow);
+		odata[out_index] = sqrt(x_pow+y_pow);
+	}
+
+}
+
 static const char *_cublasGetErrorEnum(cublasStatus_t status)
 {
     switch (status)
@@ -652,4 +790,130 @@ static const char *_cublasGetErrorEnum(cublasStatus_t status)
 	}
 	   
 	return "<unknown>";
+}
+
+__global__ void reduce2(double *g_idata, double *g_odata){
+
+	// Sequential addressing is conflict free
+	extern __shared__ double sdata[];
+
+	// each thread loads one element from global to shared mem
+	unsigned int tid = threadIdx.x;
+	unsigned int i = blockIdx.x*blockDim.x + threadIdx.x;
+	sdata[tid] = g_idata[i];
+	__syncthreads();
+
+	for (unsigned int s=blockDim.x/2; s>0; s>>=1){
+		if (tid < s){
+			sdata[tid] += sdata[tid+s];
+		}
+		__syncthreads();
+	}
+
+	if (tid==0) g_odata[blockIdx.x] = sdata[0];
+}
+
+// HALVE THE NUMBER OF BLOCKS, AND REPLACE SINGLE LOAD
+__global__ void reduce3(double *g_idata, double *g_odata){
+
+	// Sequential addressing is conflict free
+	extern __shared__ double sdata[];
+
+	// perform first level of reduction
+	// reading from global memory, writing to shared memory
+	unsigned int tid = threadIdx.x;
+	unsigned int i = blockIdx.x*(blockDim.x*2) + threadIdx.x;
+	sdata[tid] = g_idata[i] + g_idata[i+blockDim.x];
+	__syncthreads();
+
+	for (unsigned int s=blockDim.x/2; s>0; s>>=1){
+		if (tid < s){
+			sdata[tid] += sdata[tid+s];
+		}
+		__syncthreads();
+	}
+
+	if (tid==0) g_odata[blockIdx.x] = sdata[0];
+}
+
+__global__ void variance2(double *g_idata, double *g_odata, double* reduce_sum, double sum_divider){
+
+	double mean = reduce_sum[0] / sum_divider;	
+	// Sequential addressing is conflict free
+	extern __shared__ double sdata[];
+
+	// each thread loads one element from global to shared mem
+	unsigned int tid = threadIdx.x;
+	unsigned int i = blockIdx.x*blockDim.x + threadIdx.x;
+	sdata[tid] = pow(g_idata[i] - mean, 2.0);
+	__syncthreads();
+
+	for (unsigned int s=blockDim.x/2; s>0; s>>=1){
+		if (tid < s){
+			sdata[tid] += sdata[tid+s];
+		}
+		__syncthreads();
+	}
+
+	if (tid==0) g_odata[blockIdx.x] = sdata[0];
+}
+
+
+template <unsigned int blockSize>
+__global__ void variance6(double *g_idata, double* g_odata, unsigned int n, double* reduce_sum, double sum_divider){
+
+	double mean = reduce_sum[0] / sum_divider;	
+	extern __shared__ double sdata[];
+
+	unsigned int tid = threadIdx.x;
+	unsigned int i = blockIdx.x*(blockSize*2) + tid;
+	unsigned int gridSize = blockSize*2*gridDim.x;
+	sdata[tid] = 0;
+
+	while (i < n) { sdata[tid] += pow(g_idata[i] - mean, 2.0) + pow(g_idata[i+blockSize] - mean, 2.0);  i += gridSize; }
+	__syncthreads();
+
+	if (blockSize >= 512) { if (tid < 256) { sdata[tid] += sdata[tid + 256]; } __syncthreads(); }
+	if (blockSize >= 256) { if (tid < 128) { sdata[tid] += sdata[tid + 128]; } __syncthreads(); }
+	if (blockSize >= 128) { if (tid <   64) { sdata[tid] += sdata[tid +   64]; } __syncthreads(); }
+
+	if (tid < 32) {
+		if (blockSize >=  64) sdata[tid] += sdata[tid + 32];
+		if (blockSize >=  32) sdata[tid] += sdata[tid + 16];
+		if (blockSize >=  16) sdata[tid] += sdata[tid +  8];
+		if (blockSize >=    8) sdata[tid] += sdata[tid +  4];
+		if (blockSize >=    4) sdata[tid] += sdata[tid +  2];
+		if (blockSize >=    2) sdata[tid] += sdata[tid +  1];
+	}
+
+	if (tid == 0) g_odata[blockIdx.x] = sdata[0];
+}
+
+template <unsigned int blockSize>
+__global__ void reduce6(double *g_idata, double* g_odata, unsigned int n){
+
+	extern __shared__ double sdata[];
+
+	unsigned int tid = threadIdx.x;
+	unsigned int i = blockIdx.x*(blockSize*2) + tid;
+	unsigned int gridSize = blockSize*2*gridDim.x;
+	sdata[tid] = 0.0;
+
+	while (i < n) { sdata[tid] += g_idata[i] + g_idata[i+blockSize];  i += gridSize; }
+	__syncthreads();
+
+	if (blockSize >= 512) { if (tid < 256) { sdata[tid] += sdata[tid + 256]; } __syncthreads(); }
+	if (blockSize >= 256) { if (tid < 128) { sdata[tid] += sdata[tid + 128]; } __syncthreads(); }
+	if (blockSize >= 128) { if (tid <   64) { sdata[tid] += sdata[tid +   64]; } __syncthreads(); }
+
+	if (tid < 32) {
+		if (blockSize >=  64) sdata[tid] += sdata[tid + 32];
+		if (blockSize >=  32) sdata[tid] += sdata[tid + 16];
+		if (blockSize >=  16) sdata[tid] += sdata[tid +  8];
+		if (blockSize >=    8) sdata[tid] += sdata[tid +  4];
+		if (blockSize >=    4) sdata[tid] += sdata[tid +  2];
+		if (blockSize >=    2) sdata[tid] += sdata[tid +  1];
+	}
+
+	if (tid == 0) g_odata[blockIdx.x] = sdata[0];
 }
