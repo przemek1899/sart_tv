@@ -2,8 +2,6 @@
 #define SART_CONSTANTS_H
 
 /* Parametry RecPF */
-const double aTV = 1.2e-4;
-const double aL1 = 0.0;
 
 const double negative = -1.0;
 const double positive = 1.0;
@@ -12,9 +10,9 @@ const double zero = 0.0;
 // Psi - dct2, PsiT - idct2
 
 // opts parameters
-const int maxItr = 100;
+const int maxItr = 2;
 const double gamma_var = 1.0;
-const int beta = 10;
+const double beta = 10.0;
 const double relchg_tol = 5e-4;
 const int real_sol = 1;
 const int normalize = 1;

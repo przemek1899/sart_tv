@@ -55,7 +55,7 @@ void mexFunction(int nlhs, mxArray *plhs[], int nrhs, mxArray const *prhs[]){
     d_B = (double *)(mxGPUGetData(B));
 	// ----------------- END OF MEX FILE STARTING CONFIGURATION ----------------------------
 
-	cufftHandle plan2d;
+	cufftHandle plan2d, plan2d_inverse;
 	cufftDoubleComplex *output;
 	int n = N*(N/2+1);
 	checkCudaErrors(cudaMalloc((void**)&output, sizeof(cufftDoubleComplex)*n));
@@ -67,18 +67,30 @@ void mexFunction(int nlhs, mxArray *plhs[], int nrhs, mxArray const *prhs[]){
 		mexErrMsgIdAndTxt(errId, "plan initialization failed, cufft error code\n");
 	}
 
-	// exec
+	if (cufftPlan2d(&plan2d_inverse, N, N, CUFFT_Z2D) != CUFFT_SUCCESS){
+		cudaFree(output);
+		mexErrMsgIdAndTxt(errId, "inverse plan initialization failed, cufft error code\n");
+	}
+
+	// exec fft2
 	if (cufftExecD2Z(plan2d, d_A, output) != CUFFT_SUCCESS){
 		cudaFree(output);
 		cufftDestroy(plan2d);		
 		mexErrMsgIdAndTxt(errId, "cufft exec failed, cufft error code\n");
 	}
 
+	// exec ifft2
+	if (cufftExecZ2D(plan2d_inverse, output, d_B) != CUFFT_SUCCESS){
+		cudaFree(output);
+		cufftDestroy(plan2d);	
+		mexErrMsgIdAndTxt(errId, "cufft exec failed, cufft error code\n");
+	}
+
 
 	int threads = N;
 	int blocks = N;
-	copyRealFromComplex<<<threads, blocks>>>(output, d_B, n);
-	cudaDeviceSynchronize();
+	//copyRealFromComplex<<<threads, blocks>>>(output, d_B, n);
+	//cudaDeviceSynchronize();
 	checkCudaErrors(cudaGetLastError());		
 
     plhs[0] = mxGPUCreateMxArrayOnGPU(B);
@@ -87,6 +99,7 @@ void mexFunction(int nlhs, mxArray *plhs[], int nrhs, mxArray const *prhs[]){
 	mxGPUDestroyGPUArray(B);
 
 	cufftDestroy(plan2d);
+	cufftDestroy(plan2d_inverse);
 	cudaFree(output);
 }
 

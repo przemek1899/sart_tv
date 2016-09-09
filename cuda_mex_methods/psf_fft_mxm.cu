@@ -159,10 +159,12 @@ void mexFunction(int nlhs, mxArray *plhs[], int nrhs, mxArray const *prhs[]){
 
 template<typename T>
 __global__ void psf_from_fft(cufftDoubleComplex* v, int N, int n, T* real_fft, T* result){
-
+	
 	// blocks are rows which cover the whole length, usually the matrix is of size 512x512, the NVIDIA GPU's allows maximum number
 	// of threads per block of 1024
 	
+	extern __shared__ double v_shared[];
+
 	if (threadIdx.x >= n && threadIdx.x < N){
 		v[threadIdx.x] = v[N-threadIdx.x];
 	}
@@ -173,9 +175,7 @@ __global__ void psf_from_fft(cufftDoubleComplex* v, int N, int n, T* real_fft, T
 	}
 
 	if (blockIdx.x < N && threadIdx.x < N){
-		extern __shared__ double v_shared[];
 		v_shared[threadIdx.x] = real_fft[threadIdx.x];
-
 		result[threadIdx.x+blockIdx.x*N] = v_shared[threadIdx.x] + v_shared[blockIdx.x];
 	}
 }

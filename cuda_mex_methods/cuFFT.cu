@@ -14,17 +14,14 @@ void check_cufft(cufftResult status);
 
 void mexFunction(int nlhs, mxArray *plhs[], int nrhs, mxArray const *prhs[]){
 
-	 /* Declare all variables.*/
     mxGPUArray *A, *B;
     double *d_A, *d_B;
 
     char const * const errId = "parallel:gpu:mexGPUExample:InvalidInput";
     char const * const errMsg = "Invalid input to MEX file.";
 
-    /* Initialize the MathWorks GPU API. */
     mxInitGPU();
 
-    /* Throw an error if the input is not a GPU array. */
     if ((nrhs < 2) || !(mxIsGPUArray(prhs[0]))) {
         mexErrMsgIdAndTxt(errId, errMsg);
     }
@@ -32,20 +29,11 @@ void mexFunction(int nlhs, mxArray *plhs[], int nrhs, mxArray const *prhs[]){
     A = mxGPUCopyFromMxArray (prhs[0]); // mxGPUCreateFromMxArray(prhs[0]);
 	int N = mxGetScalar(prhs[1]);
 
-    /*
-     * Verify that A really is a double array before extracting the pointer.
-     */
     if ((mxGPUGetClassID(A) != mxDOUBLE_CLASS)) {
         mexErrMsgIdAndTxt(errId, errMsg);
     }
 
-    /*
-     * Now that we have verified the data type, extract a pointer to the input
-     * data on the device.
-     */
     d_A = (double *)(mxGPUGetData(A));
-
-    /* Create a GPUArray to hold the result and get its underlying pointer. */
 
     B = mxGPUCreateGPUArray(mxGPUGetNumberOfDimensions(A),
                             mxGPUGetDimensions(A),
@@ -78,6 +66,7 @@ void mexFunction(int nlhs, mxArray *plhs[], int nrhs, mxArray const *prhs[]){
 		mexErrMsgIdAndTxt(errId, "cufft exec failed, cufft error code\n");
 	}
 
+	
 	if (cufftExecZ2D(plan_inverse, output, d_B) != CUFFT_SUCCESS){
 		mexErrMsgIdAndTxt(errId, "cufft exec failed, cufft error code\n");
 	}

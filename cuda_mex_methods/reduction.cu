@@ -10,8 +10,8 @@ __global__ void reduce0(double *g_idata, double *g_odata){
 
 	// each thread loads one element from global to shared mem
 	unsigned int tid = threadIdx.x;
-	unsigned int i = blockIdx.x*blockDimx + threadIdx.x;
-	sdata[tid] = g_idata[i]
+	unsigned int i = blockIdx.x*blockDim.x + threadIdx.x;
+	sdata[tid] = g_idata[i];
 	__syncthreads();
 
 	// do reduction in shared mem
@@ -33,8 +33,8 @@ __global__ void reduce1(double *g_idata, double *g_odata){
 
 	// each thread loads one element from global to shared mem
 	unsigned int tid = threadIdx.x;
-	unsigned int i = blockIdx.x*blockDimx + threadIdx.x;
-	sdata[tid] = g_idata[i]
+	unsigned int i = blockIdx.x*blockDim.x + threadIdx.x;
+	sdata[tid] = g_idata[i];
 	__syncthreads();
 
 	// do reduction in shared mem
@@ -43,7 +43,7 @@ __global__ void reduce1(double *g_idata, double *g_odata){
 		int index = 2*s*tid;
 
 		if(index < blockDim.x){
-			sdata[index] = += sdata[index+s];
+			sdata[index] += sdata[index+s];
 		}
 		__syncthreads();
 	}
@@ -59,11 +59,11 @@ __global__ void reduce2(double *g_idata, double *g_odata){
 
 	// each thread loads one element from global to shared mem
 	unsigned int tid = threadIdx.x;
-	unsigned int i = blockIdx.x*blockDimx + threadIdx.x;
-	sdata[tid] = g_idata[i]
+	unsigned int i = blockIdx.x*blockDim.x + threadIdx.x;
+	sdata[tid] = g_idata[i];
 	__syncthreads();
 
-	for (unsigned ints=blockDim.x/2; s>0; s>>=1){
+	for (unsigned int s=blockDim.x/2; s>0; s>>=1){
 		if (tid < s){
 			sdata[tid] += sdata[tid+s];
 		}
@@ -77,6 +77,10 @@ __global__ void reduce2(double *g_idata, double *g_odata){
 // HALVE THE NUMBER OF BLOCKS, AND REPLACE SINGLE LOAD
 __global__ void reduce3(double *g_idata, double *g_odata){
 
+	/*
+	jeœli zmniejszamy liczbê bloków o po³owê to tablica wynikowa te¿ powinna byæ krótsza po³owê
+	*/
+
 	// Sequential addressing is conflict free
 	extern __shared__ double sdata[];
 
@@ -87,13 +91,15 @@ __global__ void reduce3(double *g_idata, double *g_odata){
 	sdata[tid] = g_idata[i] + g_idata[i+blockDim.x];
 	__syncthreads();
 
-	for (unsigned ints=blockDim.x/2; s>0; s>>=1){
+	for (unsigned int s=blockDim.x/2; s>0; s>>=1){
 		if (tid < s){
 			sdata[tid] += sdata[tid+s];
 		}
 		__syncthreads();
 	}
 
+	// poczekaj ...
+	// konsekwencj¹ tego, ¿e zmniejszamy liczbê bloków o po³owê jest to, ¿e mamy krótsz¹ o po³owê tablicê wynikow¹
 	if (tid==0) g_odata[blockIdx.x] = sdata[0];
 }
 
@@ -111,7 +117,7 @@ __global__ void reduce4(double *g_idata, double *g_odata){
 	sdata[tid] = g_idata[i] + g_idata[i+blockDim.x];
 	__syncthreads();
 
-	for (unsigned ints=blockDim.x/2; s>32; s>>=1){
+	for (unsigned int s=blockDim.x/2; s>32; s>>=1){
 		if (tid < s){
 			sdata[tid] += sdata[tid+s];
 		}
